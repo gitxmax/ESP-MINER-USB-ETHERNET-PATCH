@@ -1,3 +1,6 @@
+<img width="1536" height="1024" alt="601-ether" src="https://github.com/user-attachments/assets/edc1de4c-9dbc-4d1f-9f1c-86a47e990d62" />
+
+
 # Ethernet-over-USB patch for ESP-Miner (By default, builds for Bitaxe Gamma 601)
 
 ## What this is
