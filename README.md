@@ -1,4 +1,4 @@
-# Ethernet-over-USB patch for ESP-Miner (Bitaxe Gamma / board 601)
+# Ethernet-over-USB patch for ESP-Miner (By default, builds for Bitaxe Gamma 601)
 
 ## What this is
 
