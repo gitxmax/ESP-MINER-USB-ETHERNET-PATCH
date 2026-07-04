@@ -1,0 +1,1431 @@
+diff --git a/.github/workflows/unittest.yml b/.github/workflows/unittest.yml
+index bf9ffb2..9a9477d 100644
+--- a/.github/workflows/unittest.yml
++++ b/.github/workflows/unittest.yml
+@@ -15,6 +15,14 @@ jobs:
+         with:
+           submodules: 'recursive'
+ 
++      - name: esp-idf add-dependency esp_tinyusb
++        uses: espressif/esp-idf-ci-action@v1
++        with:
++          esp_idf_version: v5.5.3
++          target: esp32s3
++          command: idf.py add-dependency "espressif/esp_tinyusb^2.0.1~1"
++          path: 'test-ci'
++
+       - name: esp-idf build
+         uses: espressif/esp-idf-ci-action@v1
+         with:
+diff --git a/components/connect/CMakeLists.txt b/components/connect/CMakeLists.txt
+index 3bd0cb0..aadf817 100644
+--- a/components/connect/CMakeLists.txt
++++ b/components/connect/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ idf_component_register(
+ SRCS
+     "connect.c"
++    "usb_net.c"
+ 
+ INCLUDE_DIRS 
+     "include"
+@@ -14,4 +15,6 @@ REQUIRES
+     "esp_event"
+     "stratum"
+     "espressif__mdns"
++    "esp_eth"
++    "esp_tinyusb"
+ )
+diff --git a/components/connect/connect.c b/components/connect/connect.c
+index e3970fb..2a6490a 100644
+--- a/components/connect/connect.c
++++ b/components/connect/connect.c
+@@ -18,6 +18,7 @@
+ #include "esp_wifi_types_generic.h"
+ 
+ #include "connect.h"
++#include "usb_net.h"
+ #include "global_state.h"
+ #include "nvs_config.h"
+ #include "esp_app_desc.h"
+@@ -436,11 +437,8 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
+                 return;
+             }
+ 
+-            GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
+-            wifi_softap_on();
+-
+             snprintf(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, sizeof(GLOBAL_STATE->SYSTEM_MODULE.wifi_status), "%s (Error %d, retry #%d)", get_wifi_reason_string(event->reason), event->reason, s_retry_num);
+-            ESP_LOGI(TAG, "Wi-Fi status: %s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
++            ESP_LOGI(TAG, "Network status: %s", GLOBAL_STATE->SYSTEM_MODULE.wifi_status);
+ 
+             // Wait a little
+             vTaskDelay(5000 / portTICK_PERIOD_MS);
+@@ -488,8 +486,6 @@ static void event_handler(void * arg, esp_event_base_t event_base, int32_t event
+ 
+         ESP_LOGI(TAG, "Connected to SSID: %s", GLOBAL_STATE->SYSTEM_MODULE.ssid);
+         strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
+-
+-        wifi_softap_off();
+         
+         // Create IPv6 link-local address after WiFi connection
+         esp_netif_t *netif = event->esp_netif;
+@@ -648,7 +644,7 @@ static void wifi_softap_on(void)
+ }
+ 
+ /* Initialize wifi station */
+-esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
++static esp_netif_t *wifi_init_sta(const char *wifi_ssid, const char *wifi_pass)
+ {
+     esp_netif_t * esp_netif_sta = esp_netif_create_default_wifi_sta();
+ 
+@@ -694,8 +690,6 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
+         strncpy((char *) wifi_sta_config.sta.password, wifi_pass, sizeof(wifi_sta_config.sta.password));
+         wifi_sta_config.sta.password[sizeof(wifi_sta_config.sta.password) - 1] = '\0';
+     }
+-    // strncpy((char *) wifi_sta_config.sta.password, wifi_pass, 63);
+-    // wifi_sta_config.sta.password[63] = '\0';
+ 
+     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta_config));
+ 
+@@ -709,7 +703,7 @@ esp_netif_t * wifi_init_sta(const char * wifi_ssid, const char * wifi_pass)
+     return esp_netif_sta;
+ }
+ 
+-void wifi_init(void * pvParameters)
++void connect_init(void * pvParameters)
+ {
+     GlobalState * GLOBAL_STATE = (GlobalState *) pvParameters;
+ 
+@@ -727,53 +721,75 @@ void wifi_init(void * pvParameters)
+     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+ 
+-    wifi_softap_on();
++    // Configure and start SoftAP
++    esp_err_t err = esp_wifi_set_mode(GLOBAL_STATE->SYSTEM_MODULE.network_mode == NETWORK_MODE_WIFI ? WIFI_MODE_APSTA : WIFI_MODE_AP);
++    if (is_wifi_operation_allowed(err)) {
++        ESP_ERROR_CHECK(err);
++    }
+ 
+-    /* Initialize AP */
++    /* Initialize SoftAP */
+     wifi_init_softap(GLOBAL_STATE);
+ 
+-    GLOBAL_STATE->SYSTEM_MODULE.ssid = nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
++    /* Configure STA BEFORE starting WiFi to avoid race condition */
++    if (GLOBAL_STATE->SYSTEM_MODULE.network_mode == NETWORK_MODE_WIFI) {
++        ESP_LOGI(TAG, "Network mode: WiFi");
+ 
+-    /* Skip connection if SSID is null */
+-    if (strlen(GLOBAL_STATE->SYSTEM_MODULE.ssid) == 0) {
+-        ESP_LOGI(TAG, "No WiFi SSID provided, skipping connection");
+-
+-        /* Start WiFi */
+-        ESP_ERROR_CHECK(esp_wifi_start());
+-
+-        /* Disable power savings for best performance */
+-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
++        /* Skip connection if SSID is null */
++        if (strlen(GLOBAL_STATE->SYSTEM_MODULE.ssid) == 0) {
++            ESP_LOGI(TAG, "No WiFi SSID provided, running in AP-only mode");
++        } else {
++            ESP_LOGI(TAG, "Configuring Wi-Fi STA");
++            char *wifi_ssid = GLOBAL_STATE->SYSTEM_MODULE.ssid;
++            char *wifi_pass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS);
+ 
+-        return;
+-    } else {
++            ESP_LOGI(TAG, "Initializing WiFi STA mode");
++            esp_netif_t *esp_netif_sta = wifi_init_sta(wifi_ssid, wifi_pass);
+ 
+-        char * wifi_pass = nvs_config_get_string(NVS_CONFIG_WIFI_PASS);
++            free(wifi_pass);
+ 
+-        /* Initialize STA */
+-        ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
+-        esp_netif_t * esp_netif_sta = wifi_init_sta(GLOBAL_STATE->SYSTEM_MODULE.ssid, wifi_pass);
++            /* Set Hostname */
++            char *hostname = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
++            esp_err_t err = esp_netif_set_hostname(esp_netif_sta, hostname);
++            if (err != ESP_OK) {
++                ESP_LOGW(TAG, "esp_netif_set_hostname failed: %s", esp_err_to_name(err));
++            } else {
++                ESP_LOGI(TAG, "Setting hostname to: %s", hostname);
++            }
++            free(hostname);
+ 
+-        free(wifi_pass);
++            ESP_LOGI(TAG, "WiFi STA initialization complete");
++        }
++    }
+ 
+-        /* Disable power savings for best performance */
+-        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
++    /* Start Wi-Fi */
++    ESP_ERROR_CHECK(esp_wifi_start());
++    /* Disable power savings for best performance */
++    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+ 
+-        char * hostname  = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
++    if (GLOBAL_STATE->SYSTEM_MODULE.network_mode == NETWORK_MODE_USB) {
++        ESP_LOGI(TAG, "Network mode: Ethernet-over-USB");
++        usb_net_init(GLOBAL_STATE);
++    }
+ 
+-        /* Set Hostname */
+-        esp_err_t err = esp_netif_set_hostname(esp_netif_sta, hostname);
+-        if (err != ERR_OK) {
+-            ESP_LOGW(TAG, "esp_netif_set_hostname failed: %s", esp_err_to_name(err));
+-        } else {
+-            ESP_LOGI(TAG, "ESP_WIFI setting hostname to: %s", hostname);
+-        }
++    ESP_LOGI(TAG, "Network initialization complete");
++}
+ 
+-        free(hostname);
++void connect_await_connection(void *pvParameters)
++{
++    GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
+ 
+-        /* Start Wi-Fi */
+-        ESP_ERROR_CHECK(esp_wifi_start());
++    // Wait for connection to be established
++    ESP_LOGI(TAG, "Waiting for network connection...");
++    while (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
++        vTaskDelay(100 / portTICK_PERIOD_MS);
++    }
+ 
+-        ESP_LOGI(TAG, "wifi_init_sta finished.");
++    // Disable AP after connection is established
++    ESP_LOGI(TAG, "Connection established, disabling AP");
++    if (GLOBAL_STATE->SYSTEM_MODULE.network_mode == NETWORK_MODE_WIFI) {
++        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
++    } else if (GLOBAL_STATE->SYSTEM_MODULE.network_mode == NETWORK_MODE_USB) {
++        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+     }
+ }
+ 
+diff --git a/components/connect/include/connect.h b/components/connect/include/connect.h
+index 3d66516..1797395 100644
+--- a/components/connect/include/connect.h
++++ b/components/connect/include/connect.h
+@@ -18,7 +18,8 @@ typedef struct {
+ } wifi_ap_record_simple_t;
+ 
+ void toggle_wifi_softap(void);
+-void wifi_init(void * GLOBAL_STATE);
++void connect_init(void * pvParameters);
++void connect_await_connection(void *pvParameters);
+ esp_err_t wifi_apply_hostname(const char *hostname);
+ esp_err_t wifi_scan(wifi_ap_record_simple_t *ap_records, uint16_t *ap_count);
+ esp_err_t get_wifi_current_rssi(int8_t *rssi);
+diff --git a/components/connect/include/usb_net.h b/components/connect/include/usb_net.h
+new file mode 100644
+index 0000000..22dd070
+--- /dev/null
++++ b/components/connect/include/usb_net.h
+@@ -0,0 +1,18 @@
++#ifndef USB_NET_H_
++#define USB_NET_H_
++
++/**
++ * @brief Initialize USB NCM (Network Control Model) network interface and CDC ACM for serial communication
++ *
++ * This function initializes TinyUSB with NCM support and creates an
++ * esp_netif interface for Ethernet-over-USB connectivity. The device will
++ * appear as an ethernet adapter to the host computer.
++ *
++ * Additionally, it initializes CDC ACM (Communication Device Class Abstract Control Model)
++ * for serial communication, allowing logging over USB serial connection.
++ *
++ * @param GLOBAL_STATE Pointer to the global state structure
++ */
++void usb_net_init(void * GLOBAL_STATE);
++
++#endif /* USB_NET_H_ */
+diff --git a/components/connect/usb_net.c b/components/connect/usb_net.c
+new file mode 100644
+index 0000000..a756e87
+--- /dev/null
++++ b/components/connect/usb_net.c
+@@ -0,0 +1,251 @@
++#include "usb_net.h"
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++
++#include "esp_event.h"
++#include "lwip/sockets.h"
++#include "tinyusb_default_config.h"
++
++#include "esp_log.h"
++#include "esp_mac.h"
++#include "esp_netif.h"
++
++#include "tinyusb_net.h"
++#include "tinyusb_cdc_acm.h"
++#include "tinyusb_console.h"
++#include "tinyusb.h"
++#include "global_state.h"
++#include "nvs_config.h"
++
++static const char *TAG = "usb_net";
++
++// Static configuration structures
++static esp_netif_driver_ifconfig_t driver_cfg;
++static esp_netif_inherent_config_t netif_cfg;
++
++// Static configuration structures
++
++/**
++ * @brief Transmit function for sending packets to USB
++ */
++static esp_err_t netif_transmit(void *h, void *buffer, size_t len)
++{
++    esp_err_t err = tinyusb_net_send_sync(buffer, len, NULL, pdMS_TO_TICKS(100));
++    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
++        // ESP_ERR_INVALID_STATE during startup is expected - USB link not ready yet
++        // DHCP will retry automatically, so don't spam logs
++        ESP_LOGE(TAG, "Failed to send buffer to USB: %s", esp_err_to_name(err));
++    }
++    return err;
++}
++
++/**
++ * @brief Free function for RX buffers
++ */
++static void l2_free(void *h, void *buffer)
++{
++    free(buffer);
++}
++
++/**
++ * @brief Callback when USB receives data from host
++ */
++static esp_err_t netif_recv_callback(void *buffer, uint16_t len, void *ctx)
++{
++    esp_netif_t *netif = (esp_netif_t *)ctx;
++    if (!netif) {
++        return ESP_OK;
++    }
++
++    // Copy buffer because TinyUSB will reuse it
++    void *buf_copy = malloc(len);
++    if (!buf_copy) {
++        ESP_LOGE(TAG, "Failed to allocate RX buffer");
++        return ESP_ERR_NO_MEM;
++    }
++
++    memcpy(buf_copy, buffer, len);
++    return esp_netif_receive(netif, buf_copy, len, NULL);
++}
++
++// Callback for CDC ACM when line state changes (DTR, RTS)
++static void cdc_acm_line_state_changed_callback(int itf, cdcacm_event_t *event)
++{
++    if (event->type == CDC_EVENT_LINE_STATE_CHANGED) {
++        cdcacm_event_line_state_changed_data_t line_state = event->line_state_changed_data;
++        ESP_LOGI(TAG, "CDC ACM Line state changed - Interface: %d, DTR: %s, RTS: %s",
++                  itf, line_state.dtr ? "true" : "false", line_state.rts ? "true" : "false");
++    }
++}
++
++// Event handler for Ethernet-over-USB IP events
++static void usb_ip_event_handler(void* arg, esp_event_base_t event_base,
++                                 int32_t event_id, void* event_data)
++{
++    GlobalState *GLOBAL_STATE = (GlobalState *)arg;
++
++    if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_GOT_IP) {
++        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
++        ESP_LOGI(TAG, "Got IP Address:" IPSTR, IP2STR(&event->ip_info.ip));
++
++        // Update global state with IP address
++        snprintf(GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str, IP4ADDR_STRLEN_MAX,
++                 IPSTR, IP2STR(&event->ip_info.ip));
++        strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Connected!");
++        GLOBAL_STATE->SYSTEM_MODULE.is_connected = true;
++
++        // Create IPv6 link-local address after USB connection
++        esp_netif_t *netif = event->esp_netif;
++        esp_err_t ipv6_err = esp_netif_create_ip6_linklocal(netif);
++        if (ipv6_err != ESP_OK) {
++            ESP_LOGE(TAG, "Failed to create IPv6 link-local address: %s", esp_err_to_name(ipv6_err));
++        }
++    }
++
++    if (event_base == IP_EVENT && event_id == IP_EVENT_GOT_IP6) {
++        ip_event_got_ip6_t* event = (ip_event_got_ip6_t*) event_data;
++
++        // Convert IPv6 address to string
++        char ipv6_str[INET6_ADDRSTRLEN];
++        inet_ntop(AF_INET6, &event->ip6_info.ip, ipv6_str, sizeof(ipv6_str));
++
++        // Check if it's a link-local address (fe80::/10)
++        if ((event->ip6_info.ip.addr[0] & 0xFFC0) == 0xFE80) {
++            // Store link-local IPv6 address
++            strncpy(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str, ipv6_str, sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1);
++            GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str[sizeof(GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str) - 1] = '\0';
++            ESP_LOGI(TAG, "IPv6 Address: %s", GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str);
++        }
++    }
++
++    if (event_base == IP_EVENT && event_id == IP_EVENT_ETH_LOST_IP) {
++        ESP_LOGI(TAG, "Lost IP");
++        strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Lost IP");
++        GLOBAL_STATE->SYSTEM_MODULE.is_connected = false;
++        GLOBAL_STATE->SYSTEM_MODULE.ip_addr_str[0] = '\0';
++        GLOBAL_STATE->SYSTEM_MODULE.ipv6_addr_str[0] = '\0';
++    }
++}
++
++void usb_net_init(void * pvParameters)
++{
++    GlobalState * GLOBAL_STATE = (GlobalState *) pvParameters;
++
++    esp_event_handler_instance_t instance_got_ip_usb;
++    esp_event_handler_instance_t instance_got_ip6_usb;
++    esp_event_handler_instance_t instance_lost_ip_usb;
++    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &usb_ip_event_handler, GLOBAL_STATE, &instance_got_ip_usb));
++    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_GOT_IP6, &usb_ip_event_handler, GLOBAL_STATE, &instance_got_ip6_usb));
++    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_LOST_IP, &usb_ip_event_handler, GLOBAL_STATE, &instance_lost_ip_usb));
++
++    char * hostname = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
++
++    // Build USB string descriptors
++    static char *string_descriptors[4];
++    string_descriptors[0] = "\x09\x04"; // Language ID: English (US)
++
++    string_descriptors[1] = "ESP-Miner"; // Manufacturer
++
++    static char product_str[64];
++    snprintf(product_str, 64, "Bitaxe %s %s (%s)", GLOBAL_STATE->DEVICE_CONFIG.family.name, GLOBAL_STATE->DEVICE_CONFIG.board_version, hostname);
++    string_descriptors[2] = product_str; // Product
++
++    uint8_t mac[6];
++    esp_efuse_mac_get_default(mac);
++
++    static char serial_str[13];
++    snprintf(serial_str, 13, "%02X%02X%02X%02X%02X%02X",
++             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++    string_descriptors[3] = serial_str; // Serial
++
++    // Initialize TinyUSB driver (descriptors from sdkconfig)
++    ESP_LOGI(TAG, "Initializing TinyUSB driver");
++    tinyusb_config_t usb_cfg = TINYUSB_DEFAULT_CONFIG();
++    usb_cfg.descriptor.string = (const char **)string_descriptors;
++    usb_cfg.descriptor.string_count = 4;
++    usb_cfg.task = TINYUSB_TASK_CUSTOM(4096, 5, 0);  // 4KB stack, priority 5, CPU0
++
++    ESP_ERROR_CHECK(tinyusb_driver_install(&usb_cfg));
++
++    ESP_LOGI(TAG, "Initializing CDC ACM for serial communication");
++    tinyusb_config_cdcacm_t acm_cfg = {
++        .cdc_port = TINYUSB_CDC_ACM_0,
++        .callback_rx = NULL,
++        .callback_rx_wanted_char = NULL,
++        .callback_line_state_changed = &cdc_acm_line_state_changed_callback,
++        .callback_line_coding_changed = NULL
++    };
++    ESP_ERROR_CHECK(tinyusb_cdcacm_init(&acm_cfg));
++    ESP_ERROR_CHECK(tinyusb_console_init(TINYUSB_CDC_ACM_0));
++
++    // Setup netif inherent config
++    netif_cfg = (esp_netif_inherent_config_t)ESP_NETIF_INHERENT_DEFAULT_ETH();
++    netif_cfg.flags = ESP_NETIF_FLAG_AUTOUP | ESP_NETIF_FLAG_EVENT_IP_MODIFIED;
++    netif_cfg.if_key = "USB_NCM";
++    netif_cfg.if_desc = "usb ncm network device";
++    netif_cfg.route_prio = 10;
++
++    // Setup driver config
++    driver_cfg = (esp_netif_driver_ifconfig_t){
++        .handle = (void *)1,  // TinyUSB NCM is a singleton, just needs non-NULL
++        .transmit = netif_transmit,
++        .driver_free_rx_buffer = l2_free
++    };
++
++    // Create netif configuration
++    esp_netif_config_t cfg = {
++        .base = &netif_cfg,
++        .driver = &driver_cfg,
++        .stack = _g_esp_netif_netstack_default_eth,
++    };
++
++    // Create the network interface
++    esp_netif_t *netif = esp_netif_new(&cfg);
++    if (!netif) {
++        ESP_LOGE(TAG, "Failed to create netif");
++        return;
++    }
++
++    // Initialize TinyUSB Net
++    ESP_LOGI(TAG, "Initializing TinyUSB NCM");
++    tinyusb_net_config_t net_cfg = {
++        .on_recv_callback = netif_recv_callback,
++        .user_context = netif,
++    };
++
++    // Get and derive MAC address from eFuse
++    uint8_t efuse_mac[6];
++    ESP_ERROR_CHECK(esp_efuse_mac_get_default(efuse_mac));
++
++    ESP_ERROR_CHECK(esp_derive_local_mac(net_cfg.mac_addr, efuse_mac));
++
++    ESP_LOGI(TAG, "USB NCM MAC: %02x:%02x:%02x:%02x:%02x:%02x",
++             net_cfg.mac_addr[0], net_cfg.mac_addr[1], net_cfg.mac_addr[2],
++             net_cfg.mac_addr[3], net_cfg.mac_addr[4], net_cfg.mac_addr[5]);
++
++    ESP_ERROR_CHECK(tinyusb_net_init(&net_cfg));
++
++    // The netif callbacks are already connected via the driver_cfg we passed to esp_netif_new
++    // TinyUSB will call netif_recv_callback when data arrives
++    // DHCP will call netif_transmit via esp_netif when it needs to send packets
++
++    // Manually start the interface
++    ESP_LOGI(TAG, "Starting network interface");
++    esp_netif_action_start(netif, NULL, 0, NULL);
++
++    // Mark interface as connected (link up)
++    esp_netif_action_connected(netif, NULL, 0, NULL);
++
++    // Give USB a moment to stabilize before starting DHCP
++    vTaskDelay(pdMS_TO_TICKS(100));
++
++    // Start the DHCP client
++    ESP_LOGI(TAG, "Starting DHCP client for Ethernet-over-USB");
++    ESP_ERROR_CHECK(esp_netif_set_mac(netif, net_cfg.mac_addr));
++    ESP_ERROR_CHECK(esp_netif_dhcpc_start(netif));
++
++    ESP_LOGI(TAG, "Ethernet-over-USB initialized successfully - waiting for IP from DHCP");
++
++    strcpy(GLOBAL_STATE->SYSTEM_MODULE.wifi_status, "Acquiring IP...");
++}
+diff --git a/ethernet-over-usb.md b/ethernet-over-usb.md
+new file mode 100644
+index 0000000..5d25790
+--- /dev/null
++++ b/ethernet-over-usb.md
+@@ -0,0 +1,104 @@
++# Ethernet-over-USB
++
++This provides a direct wired connection via the USB port, useful for environments where WiFi is unavailable or undesirable.
++
++## Switching Network Modes
++
++Use the API to switch between WiFi and USB modes:
++
++```bash
++# Switch to Ethernet-over-USB mode
++curl -X PATCH http://YOUR-BITAXE-IP/api/system \
++     -H "Content-Type: application/json" \
++     -d '{"networkMode": "usb"}'
++
++# Restart to apply
++curl -X POST http://YOUR-BITAXE-IP/api/system/restart
++
++# Switch back to WiFi mode
++curl -X PATCH http://YOUR-BITAXE-IP/api/system \
++     -H "Content-Type: application/json" \
++     -d '{"networkMode": "wifi"}'
++```
++
++## Host Computer Setup (Linux)
++
++When using Ethernet-over-USB mode, your computer needs to provide network connectivity to the device.
++
++### Option 1: NetworkManager GUI (Easiest)
++1. Connect the Bitaxe via USB.
++2. Wait for the "Ethernet-over-USB" interface to appear in Network Settings.
++3. Edit the connection → IPv4 Settings.
++4. Set Method to **"Shared to other computers"**.
++5. Save and reconnect.
++
++The device will automatically get an IP address (typically `10.42.0.X`), and you can access the web UI at that address.
++
++### Option 2: NetworkManager CLI
++```bash
++# Find the USB interface
++nmcli device status | grep ethernet
++
++# Create and activate shared connection (replace usb0 with your interface)
++nmcli connection add type ethernet ifname usb0 con-name "USB-Miner" \
++  ipv4.method shared
++nmcli connection up "USB-Miner"
++```
++
++### Option 3: Manual DHCP Server
++```bash
++# Install dnsmasq
++sudo apt install dnsmasq
++
++# Configure interface
++sudo ip addr add 192.168.7.1/24 dev usb0
++sudo ip link set usb0 up
++
++# Start DHCP server
++sudo dnsmasq --interface=usb0 --dhcp-range=192.168.7.2,192.168.7.254 --no-daemon
++```
++
++## Technical Details
++
++- **Protocol**: USB NCM (Network Control Model)
++- **Device Class**: CDC NCM (Communications Device Class)
++- **USB Descriptors**:
++  - Vendor ID: 0x303A (Espressif)
++  - Manufacturer: "ESP-Miner"
++  - Product: "Bitaxe [family] [model] ([hostname])"
++  - Serial: [MAC address]
++
++## Limitations
++
++- The ESP32-S3 has a single USB port used for both flashing/logging and Ethernet-over-USB.
++- When Ethernet-over-USB is active, USB serial logging is interrupted briefly when switching over from the ROM USB PHY to TinyUSB.
++- To flash the device, it first needs to be put in bootloader mode by holding the BOOT button and resetting the device.
++- Windows 10 may require manual driver installation for NCM support (see Windows 10 Setup section).
++
++## Windows 10 Setup
++
++To share your Windows 10 PC's internet connection to a device via USB using the Network Control Model (NCM) protocol, you need to enable Internet Connection Sharing (ICS) after ensuring the correct driver is installed for the connected device.
++
++### Step 1: Ensure the Correct USB NCM Driver is Installed
++When you connect a device (like an Android phone or development board) and enable "USB tethering" on the device side, Windows should recognize it. If it doesn't appear correctly under Network adapters, you may need to manually update the driver to use the built-in Microsoft driver.
++
++1. Open Device Manager: Right-click the Windows Start menu and select Device Manager.
++2. Locate the device: Look for the device under the "Other devices" category (it might appear as "CDC NCM" or an unknown device).
++3. Update the driver: Right-click the entry and select "Update Driver".
++4. Browse for drivers: Select "Browse my computer for drivers", then "Let me pick from a list of available drivers on my computer".
++5. Select Network adapters: From the list of Common hardware types, scroll down and select "Network adapters", then click Next.
++6. Select Microsoft and UsbNcm Host Device: Under Manufacturer, select "Microsoft". Under Model, select "UsbNcm Host Device" and click Next.
++7. Confirm installation: Click Yes if a warning message appears. The device should now appear as a "UsbNcm Host Device" under the "Network adapters" category.
++
++### Step 2: Configure Internet Connection Sharing (ICS)
++Once the device is correctly recognized as a network adapter, you can share your computer's active internet connection with it.
++
++1. Open Network Connections: Right-click the network icon in your system tray and select "Open Network & Internet settings". In the settings window, click "Change adapter options" under "Advanced network settings".
++2. Identify your internet source: In the "Network Connections" window, right-click the network adapter that has the active internet access (e.g., your Wi-Fi or Ethernet connection).
++3. Open properties: Select "Properties" from the context menu.
++4. Enable sharing: Go to the "Sharing" tab.
++5. Check the box for "Allow other network users to connect through this computer's Internet connection".
++6. Select the NCM connection: In the dropdown menu under that checkbox, select the new USB network connection you just installed (labeled something like "Ethernet X" with "UsbNcm Host Device" underneath).
++7. Confirm: Click OK. You may receive an alert about enabling ICS; click Yes to continue.
++
++Your connected device should now be able to use your Windows 10 PC's internet connection. You may need to unplug and replug the USB cable or disable/re-enable USB tethering on the connected device for the changes to take effect.
+diff --git a/main/bap/bap_subscription.c b/main/bap/bap_subscription.c
+index 38bbb6a..495fb20 100644
+--- a/main/bap/bap_subscription.c
++++ b/main/bap/bap_subscription.c
+@@ -37,6 +37,7 @@ typedef struct {
+     char fan_speed[32];
+     char best_difficulty[32];
+     char block_height[32];
++    char wifi_status[256];
+     char wifi_ssid[64];
+     char wifi_password[64];
+     char wifi_rssi[32];
+@@ -55,6 +56,7 @@ typedef struct {
+     bool fan_speed;
+     bool best_difficulty;
+     bool block_height;
++    bool wifi_status;
+     bool wifi_ssid;
+     bool wifi_password;
+     bool wifi_rssi;
+@@ -324,7 +326,7 @@ void BAP_send_subscription_update(GlobalState *state) {
+                             snprintf(wifi_status_str, sizeof(wifi_status_str), "%s", state->SYSTEM_MODULE.wifi_status);
+                             
+                             int8_t current_rssi = -128; // no connection
+-                            if (state->SYSTEM_MODULE.is_connected) {
++                            if (state->SYSTEM_MODULE.is_connected && state->SYSTEM_MODULE.network_mode == NETWORK_MODE_WIFI) {
+                                 get_wifi_current_rssi(&current_rssi);
+                             }
+                             snprintf(rssi_str, sizeof(rssi_str), "%d", current_rssi);
+@@ -334,6 +336,7 @@ void BAP_send_subscription_update(GlobalState *state) {
+                             if (!wifi_pass) {
+                                 wifi_pass = strdup("");
+                             }
++                            BAP_send_if_changed("network_status", wifi_status_str, last_values.wifi_status, sizeof(last_values.wifi_status), &last_values_valid.wifi_status);
+                             BAP_send_if_changed("wifi_ssid", state->SYSTEM_MODULE.ssid, last_values.wifi_ssid, sizeof(last_values.wifi_ssid), &last_values_valid.wifi_ssid);
+                             BAP_send_if_changed("wifi_password", wifi_pass, last_values.wifi_password, sizeof(last_values.wifi_password), &last_values_valid.wifi_password);
+                             BAP_send_if_changed("wifi_rssi", rssi_str, last_values.wifi_rssi, sizeof(last_values.wifi_rssi), &last_values_valid.wifi_rssi);
+diff --git a/main/global_state.h b/main/global_state.h
+index 7ef9359..09db747 100644
+--- a/main/global_state.h
++++ b/main/global_state.h
+@@ -42,6 +42,11 @@ typedef struct {
+     uint32_t count;
+ } RejectedReasonStat;
+ 
++typedef enum {
++    NETWORK_MODE_WIFI,
++    NETWORK_MODE_USB,
++} NetworkMode;
++
+ typedef struct
+ {
+     float current_hashrate;
+@@ -62,8 +67,9 @@ typedef struct
+     char best_session_diff_string[DIFF_STRING_SIZE];
+     int block_found;
+     bool show_new_block;
++    NetworkMode network_mode;
+     char * ssid;
+-    char wifi_status[256];
++    char wifi_status[256]; // network_status
+     char ip_addr_str[16]; // IP4ADDR_STRLEN_MAX
+     char ipv6_addr_str[64]; // IPv6 address string with zone identifier (INET6_ADDRSTRLEN=46 + % + interface=15)
+     char ap_ssid[12];
+diff --git a/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.html b/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.html
+index 62d1efc..7ec7351 100644
+--- a/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.html
++++ b/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.html
+@@ -11,6 +11,28 @@
+                 <input pInputText id="hostname" type="text" formControlName="hostname" />
+             </div>
+         </div>
++
++        <div class="field grid p-fluid">
++            <label for="networkMode" class="col-12 md:col-2 md:m-0">
++                <tooltip-text-icon
++                    text="Network Mode"
++                    tooltip="Select Wi-Fi or Ethernet-over-USB for network connectivity"
++                />
++            </label>
++            <div class="col-12 md:col-10">
++                <p-select
++                    id="networkMode"
++                    formControlName="networkMode"
++                    [options]="networkModeOptions"
++                    optionLabel="label"
++                    optionValue="value"
++                    placeholder="Select network mode">
++                </p-select>
++            </div>
++        </div>
++
++        <!-- WiFi-specific fields - only shown when networkMode is 'wifi' -->
++        <ng-container *ngIf="form.get('networkMode')?.value === 'wifi'">
+         <div class="field grid p-fluid">
+             <label for="ssid" class="col-12 md:col-2 md:m-0">Wi-Fi SSID</label>
+             <div class="col-12 md:col-10 flex gap-2 align-items-center">
+@@ -36,6 +58,7 @@
+                 </p-iconfield>
+             </div>
+         </div>
++        </ng-container>
+ 
+         <div class="flex mt-5 gap-3">
+             <button pButton [disabled]="!form.dirty || form.invalid" (click)="updateSystem()"
+diff --git a/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.ts b/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.ts
+index 4eb68e4..728f350 100644
+--- a/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.ts
++++ b/main/http_server/axe-os/src/app/components/network-edit/network.edit.component.ts
+@@ -26,6 +26,11 @@ export class NetworkEditComponent implements OnInit {
+   public savedChanges: boolean = false;
+   public scanning: boolean = false;
+ 
++  public networkModeOptions = [
++    { label: 'Wi-Fi', value: 'wifi' },
++    { label: 'Ethernet-over-USB', value: 'usb' }
++  ];
++
+   @Input() uri = '';
+ 
+   constructor(
+@@ -44,10 +49,23 @@ export class NetworkEditComponent implements OnInit {
+       .pipe(first(), this.loadingService.lockUIUntilComplete())
+       .subscribe(info => {
+         this.form = this.fb.group({
++          networkMode: [info.networkMode || 'wifi', [Validators.required]],
+           hostname: [info.hostname, [Validators.required]],
+-          ssid: [info.ssid, [Validators.required]],
++          ssid: [info.ssid],  // Not required when USB mode
+           wifiPass: ['*****'],
+         });
++
++        // Update validators when network mode changes
++        this.form.get('networkMode')?.valueChanges.subscribe(mode => {
++          const ssidControl = this.form.get('ssid');
++          if (mode === 'wifi') {
++            ssidControl?.setValidators([Validators.required]);
++          } else {
++            ssidControl?.clearValidators();
++          }
++          ssidControl?.updateValueAndValidity();
++        });
++
+         this.formSubject.next(this.form);
+       });
+   }
+diff --git a/main/http_server/axe-os/src/app/components/system/system.component.ts b/main/http_server/axe-os/src/app/components/system/system.component.ts
+index b315a92..3d6288d 100644
+--- a/main/http_server/axe-os/src/app/components/system/system.component.ts
++++ b/main/http_server/axe-os/src/app/components/system/system.component.ts
+@@ -88,11 +88,16 @@ export class SystemComponent implements OnInit, OnDestroy {
+       { label: 'ASIC Type', value: (data.asic.asicCount > 1 ? data.asic.asicCount + 'x ' : ' ') + data.asic.ASICModel, class: 'pb-3' },
+       { label: 'Uptime', value: DateAgoPipe.transform(data.info.uptimeSeconds) },
+       { label: 'Reset Reason', value: data.info.resetReason, class: 'pb-3' },
+-      { label: 'Wi-Fi SSID', value: data.info.ssid, isSensitiveData: true },
+-      { label: 'Wi-Fi Status', value: data.info.wifiStatus },
+-      { label: 'Wi-Fi RSSI', value: data.info.wifiRSSI + ' dBm', valueClass: this.getWifiRssiColor(data.info.wifiRSSI), tooltip: this.getWifiRssiTooltip(data.info.wifiRSSI) },
+-      { label: 'Wi-Fi IPv4', value: data.info.ipv4},
+-      { label: 'Wi-Fi IPv6', value: data.info.ipv6, class: 'pb-3', isSensitiveData: true},
++      { label: 'Network Mode', value: data.info.networkMode === 'wifi' ? 'Wi-Fi' : 'Ethernet-over-USB' },
++
++      ...(data.info.networkMode === 'wifi' ? [
++        { label: 'Wi-Fi SSID', value: data.info.ssid, isSensitiveData: true },
++        { label: 'Wi-Fi RSSI', value: data.info.wifiRSSI + ' dBm', valueClass: this.getWifiRssiColor(data.info.wifiRSSI), tooltip: this.getWifiRssiTooltip(data.info.wifiRSSI) }
++      ] : []),
++
++      { label: 'Network Status', value: data.info.networkStatus || 'Unknown' },
++      { label: 'IPv4 Address', value: data.info.ipv4 },
++      { label: 'IPv6 Address', value: data.info.ipv6, class: 'pb-3', isSensitiveData: true },
+       { label: 'MAC Address', value: data.info.macAddr, class: 'pb-3', isSensitiveData: true },
+       { label: 'CPU Usage', value: data.info.cpuUsage.toFixed(1) + '%'},
+       { label: 'Free Heap Memory', value: ByteSuffixPipe.transform(data.info.freeHeap)},
+diff --git a/main/http_server/axe-os/src/app/layout/app.menu.component.ts b/main/http_server/axe-os/src/app/layout/app.menu.component.ts
+index 5f330c2..556be3c 100644
+--- a/main/http_server/axe-os/src/app/layout/app.menu.component.ts
++++ b/main/http_server/axe-os/src/app/layout/app.menu.component.ts
+@@ -28,13 +28,13 @@ export class AppMenuComponent implements OnInit {
+         items: [
+           { label: 'Dashboard', icon: 'pi pi-fw pi-home', routerLink: ['/'] },
+           { label: 'Scoreboard', icon: 'pi pi-fw pi-trophy', routerLink: ['scoreboard'] },
+-          { label: 'Swarm', icon: 'pi pi-fw pi-sitemap', routerLink: ['swarm'] },
+-          { label: 'Logs', icon: 'pi pi-fw pi-list', routerLink: ['logs'] },
++          { label: 'Swarm', icon: 'pi pi-fw pi-list', routerLink: ['swarm'] },
++          { label: 'Logs', icon: 'pi pi-fw pi-clipboard', routerLink: ['logs'] },
+           { label: 'System', icon: 'pi pi-fw pi-wave-pulse', routerLink: ['system'] },
+           { separator: true },
+ 
+           { label: 'Pool', icon: 'pi pi-fw pi-server', routerLink: ['pool'] },
+-          { label: 'Network', icon: 'pi pi-fw pi-wifi', routerLink: ['network'] },
++          { label: 'Network', icon: 'pi pi-fw pi-globe', routerLink: ['network'] },
+           { label: 'Theme', icon: 'pi pi-fw pi-palette', routerLink: ['design'] },
+           { label: 'Settings', icon: 'pi pi-fw pi-cog', routerLink: ['settings'] },
+           { label: 'Update', icon: 'pi pi-fw pi-sync', routerLink: ['update'] },
+diff --git a/main/http_server/axe-os/src/app/layout/app.topbar.component.html b/main/http_server/axe-os/src/app/layout/app.topbar.component.html
+index 0b8e07d..885402c 100644
+--- a/main/http_server/axe-os/src/app/layout/app.topbar.component.html
++++ b/main/http_server/axe-os/src/app/layout/app.topbar.component.html
+@@ -70,9 +70,13 @@
+                 <a routerLink="network"
+                     class="block py-2"
+                     tooltipPosition="bottom"
+-                    pTooltip="Wi-Fi RSSI: {{info.wifiRSSI}} dBm"
++                    [pTooltip]="info.networkMode === 'wifi' ? 'Wi-Fi RSSI: ' + info.wifiRSSI + ' dBm' : 'Ethernet-over-USB'"
+                 >
+-                    <wifi-icon [rssi]="info.wifiRSSI" />
++                    @if (info.networkMode === 'wifi') {
++                        <wifi-icon [rssi]="info.wifiRSSI" />
++                    } @else {
++                        <i class="pi pi-sitemap text-white block" style="font-size: 1.4rem;"></i>
++                    }
+                 </a>
+             </li>
+             <li>
+diff --git a/main/http_server/axe-os/src/app/services/system.service.ts b/main/http_server/axe-os/src/app/services/system.service.ts
+index 808f608..823a3a9 100644
+--- a/main/http_server/axe-os/src/app/services/system.service.ts
++++ b/main/http_server/axe-os/src/app/services/system.service.ts
+@@ -79,11 +79,12 @@ export class SystemApiService {
+         coreVoltageActual: 1200,
+         hostname: "Bitaxe",
+         macAddr: "2C:54:91:88:C9:E3",
++        networkMode: "wifi",
+         ssid: "default",
+         ipv4: "192.168.1.1",
+         ipv6: "fe80::62be:b4ff:fe04:ea9c",
+         wifiPass: "password",
+-        wifiStatus: "Connected!",
++        networkStatus: "Connected!",
+         wifiRSSI: -32,
+         apEnabled: 0,
+         sharesAccepted: 1,
+diff --git a/main/http_server/http_server.c b/main/http_server/http_server.c
+index 004db5c..76a4e58 100644
+--- a/main/http_server/http_server.c
++++ b/main/http_server/http_server.c
+@@ -1056,7 +1056,7 @@ static esp_err_t GET_system_info(httpd_req_t * req)
+     char * hostname_base = nvs_config_get_string(NVS_CONFIG_HOSTNAME);
+     char * mdns_hostname = GLOBAL_STATE->SYSTEM_MODULE.mdns_hostname;
+     char full_hostname[72]; // 64 (mdns_hostname max) + 6 (".local") + 2 (margin)
+-    
++
+     if (mdns_hostname != NULL && strlen(mdns_hostname) > 0) {
+         snprintf(full_hostname, sizeof(full_hostname), "%s.local", mdns_hostname);
+     } else {
+diff --git a/main/http_server/openapi.yaml b/main/http_server/openapi.yaml
+index a729015..091871f 100644
+--- a/main/http_server/openapi.yaml
++++ b/main/http_server/openapi.yaml
+@@ -206,7 +206,8 @@ components:
+         - axeOSVersion
+         - voltage
+         - vrTemp
+-        - wifiStatus
++        - networkMode
++        - networkStatus
+         - wifiRSSI
+         - displayTimeout
+         - statsFrequency
+@@ -492,9 +493,12 @@ components:
+         vrTemp:
+           type: number
+           description: Voltage regulator temperature
+-        wifiStatus:
++        networkMode:
+           type: string
+-          description: WiFi connection status
++          description: Network mode (wifi or usb)
++        networkStatus:
++          type: string
++          description: Network connection status
+         wifiRSSI:
+           type: number
+           description: WiFi signal strength
+diff --git a/main/http_server/system_api_json.c b/main/http_server/system_api_json.c
+index 8f9b95f..adb4082 100644
+--- a/main/http_server/system_api_json.c
++++ b/main/http_server/system_api_json.c
+@@ -94,8 +94,10 @@ static void system_api_add_telemetry(cJSON *root, GlobalState *g) {
+     cJSON_AddStringToObject(root, "wifiStatus", g->SYSTEM_MODULE.wifi_status);
+ 
+     int8_t rssi = -90;
+-    get_wifi_current_rssi(&rssi);
+-    cJSON_AddNumberToObject(root, "wifiRSSI", rssi);
++    if (g->SYSTEM_MODULE.network_mode == NETWORK_MODE_WIFI) {
++        get_wifi_current_rssi(&rssi);
++        cJSON_AddNumberToObject(root, "wifiRSSI", rssi);
++    }
+ 
+     // Faults
+     if (g->SYSTEM_MODULE.power_fault > 0) {
+@@ -137,6 +139,10 @@ static void system_api_add_config(cJSON *root, GlobalState *g) {
+     free(hostname);
+ 
+     // Network Config
++    char *network_mode = nvs_config_get_string(NVS_CONFIG_NETWORK_MODE);
++    cJSON_AddStringToObject(root, "networkMode", network_mode ? network_mode : "wifi");
++    free(network_mode);
++
+     char *ssid = nvs_config_get_string(NVS_CONFIG_WIFI_SSID);
+     cJSON_AddStringToObject(root, "ssid", ssid ? ssid : "Unknown");
+     free(ssid);
+diff --git a/main/idf_component.yml b/main/idf_component.yml
+index 49883c1..47a1231 100644
+--- a/main/idf_component.yml
++++ b/main/idf_component.yml
+@@ -4,6 +4,7 @@ dependencies:
+   espressif/esp_lvgl_port: "2.6.3"
+   esp_lcd_sh1107: "1.1.0"  
+   espressif/mdns: "^1.8.0"
++  espressif/esp_tinyusb: "2.0.1~1"
+   ## Required IDF version
+   idf:
+     version: ">=5.5.0"
+diff --git a/main/main.c b/main/main.c
+index e0582b8..dcc7393 100644
+--- a/main/main.c
++++ b/main/main.c
+@@ -2,6 +2,7 @@
+ 
+ #include "esp_event.h"
+ #include "esp_log.h"
++#include "esp_netif.h"
+ #include "esp_psram.h"
+ #include "esp_heap_caps.h"
+ #include "cJSON.h"
+@@ -23,6 +24,7 @@
+ #include "bap/bap.h"
+ #include "device_config.h"
+ #include "connect.h"
++#include "usb_net.h"
+ #include "asic_reset.h"
+ #include "asic_init.h"
+ #include "task_monitor.h"
+@@ -129,7 +131,7 @@ void app_main(void)
+     }
+ 
+     if (!GLOBAL_STATE.SELF_TEST_MODULE.is_active) {
+-        wifi_init(&GLOBAL_STATE);
++      connect_init(&GLOBAL_STATE);
+     }
+ 
+     esp_err_t system_init_ret = SYSTEM_init_peripherals(&GLOBAL_STATE);
+@@ -162,9 +164,7 @@ void app_main(void)
+         // Continue anyway, as BAP is not critical for core functionality
+     }
+ 
+-    while (!GLOBAL_STATE.SYSTEM_MODULE.is_connected) {
+-        vTaskDelay(100 / portTICK_PERIOD_MS);
+-    }
++    connect_await_connection(&GLOBAL_STATE);
+ 
+     queue_init(&GLOBAL_STATE.stratum_queue);
+ 
+diff --git a/main/nvs_config.c b/main/nvs_config.c
+index c173c1c..6598cac 100644
+--- a/main/nvs_config.c
++++ b/main/nvs_config.c
+@@ -52,6 +52,7 @@ static Settings settings[NVS_CONFIG_COUNT] = {
+     [NVS_CONFIG_WIFI_SSID]                             = {.nvs_key_name = "wifissid",        .type = TYPE_STR,   .default_value = {.str = (char *)CONFIG_ESP_WIFI_SSID},                .rest_name = "ssid",                               .min = 1,  .max = 32},
+     [NVS_CONFIG_WIFI_PASS]                             = {.nvs_key_name = "wifipass",        .type = TYPE_STR,   .default_value = {.str = (char *)CONFIG_ESP_WIFI_PASSWORD},            .rest_name = "wifiPass",                           .min = 0,  .max = 63},
+     [NVS_CONFIG_HOSTNAME]                              = {.nvs_key_name = "hostname",        .type = TYPE_STR,   .default_value = {.str = (char *)CONFIG_LWIP_LOCAL_HOSTNAME},          .rest_name = "hostname",                           .min = 1,  .max = 32},
++    [NVS_CONFIG_NETWORK_MODE]                          = {.nvs_key_name = "netmode",         .type = TYPE_STR,   .default_value = {.str = "wifi"},                                      .rest_name = "networkMode",                        .min = 0,  .max = 8},
+ 
+     [NVS_CONFIG_STRATUM_PROTOCOL]                      = {.nvs_key_name = "stratumprot",     .type = TYPE_STR,   .default_value = {.str = STRATUM_V1},                                  .rest_name = "stratumProtocol",                    .min = 3,  .max = 3},
+     [NVS_CONFIG_STRATUM_URL]                           = {.nvs_key_name = "stratumurl",      .type = TYPE_STR,   .default_value = {.str = (char *)CONFIG_STRATUM_URL},                  .rest_name = "stratumURL",                         .min = 0,  .max = NVS_STR_LIMIT},
+diff --git a/main/nvs_config.h b/main/nvs_config.h
+index e2181c3..481d78e 100644
+--- a/main/nvs_config.h
++++ b/main/nvs_config.h
+@@ -9,6 +9,7 @@ typedef enum {
+     NVS_CONFIG_WIFI_SSID,
+     NVS_CONFIG_WIFI_PASS,
+     NVS_CONFIG_HOSTNAME,
++    NVS_CONFIG_NETWORK_MODE,
+ 
+     NVS_CONFIG_STRATUM_PROTOCOL,   
+     NVS_CONFIG_STRATUM_URL,
+diff --git a/main/screen.c b/main/screen.c
+index 3c38d37..199d71f 100644
+--- a/main/screen.c
++++ b/main/screen.c
+@@ -1,8 +1,5 @@
+ #include <string.h>
+-#include "esp_log.h"
+ #include "esp_err.h"
+-#include "esp_check.h"
+-#include "lvgl.h"
+ #include "esp_lvgl_port.h"
+ #include "global_state.h"
+ #include "screen.h"
+@@ -20,17 +17,17 @@ typedef enum {
+     SCR_CONNECTION,
+     SCR_BITAXE_LOGO,
+     SCR_OSMU_LOGO,
+-    SCR_URLS,
++    SCR_POOL,
+     SCR_STATS,
+     SCR_MINING,
+-    SCR_WIFI,
++    SCR_NETWORK,
+     MAX_SCREENS,
+ } screen_t;
+ 
+ #define SCREEN_UPDATE_MS 500
+ #define BUTTON_WAKE_MS 5000
+ 
+-#define SCR_CAROUSEL_START SCR_URLS
++#define SCR_CAROUSEL_START SCR_POOL
+ 
+ extern const lv_img_dsc_t bitaxe_logo;
+ extern const lv_img_dsc_t osmu_logo;
+@@ -63,19 +60,21 @@ static lv_obj_t *mining_scriptsig_label;
+ static lv_obj_t *firmware_update_scr_filename_label;
+ static lv_obj_t *firmware_update_scr_status_label;
+ 
+-static lv_obj_t *connection_wifi_status_label;
++static lv_obj_t *connection_network_status_label;
+ 
+-static lv_obj_t *urls_ip_addr_label;
+-static lv_obj_t *urls_mining_url_label;
++static lv_obj_t *pool_url_label;
++static lv_obj_t *pool_difficulty_label;
++static lv_obj_t *pool_response_time_label;
+ 
+ static lv_obj_t *stats_hashrate_label;
+ static lv_obj_t *stats_efficiency_label;
+ static lv_obj_t *stats_difficulty_label;
+ static lv_obj_t *stats_temp_label;
+ 
+-static lv_obj_t *wifi_rssi_value_label;
+-static lv_obj_t *wifi_signal_strength_label;
+-static lv_obj_t *wifi_uptime_label;
++static lv_obj_t *network_ip_addr_label;
++static lv_obj_t *network_wifi_rssi_value_label;
++static lv_obj_t *network_wifi_signal_strength_label;
++static lv_obj_t *network_uptime_label;
+ 
+ static lv_obj_t *notification_label;
+ static lv_obj_t *identify_image;
+@@ -105,6 +104,8 @@ static uint64_t current_shares_rejected;
+ static uint64_t current_work_received;
+ static int8_t current_rssi_value;
+ static int current_block_height;
++static double current_pool_response_time;
++static int current_pool_difficulty;
+ 
+ static screen_t get_current_screen() {
+     lv_obj_t * active_screen = lv_screen_active();
+@@ -233,18 +234,28 @@ static lv_obj_t * create_scr_firmware() {
+     return scr;
+ }
+ 
+-static lv_obj_t * create_scr_connection(const char * ssid, const char * ap_ssid) {
++// Connection screen - works for both WiFi and USB modes
++static lv_obj_t * create_scr_connection(const char * ssid, const char * ap_ssid, NetworkMode network_mode) {
+     lv_obj_t * text_cont;
+     lv_obj_t * scr = create_screen_with_qr(ap_ssid, 4, &text_cont);
+ 
+     lv_obj_t *label1 = lv_label_create(text_cont);
+     lv_obj_set_width(label1, lv_pct(100));
+     lv_label_set_long_mode(label1, LV_LABEL_LONG_SCROLL_CIRCULAR);
+-    lv_label_set_text_fmt(label1, "Wi-Fi: %s", ssid);
+ 
+-    connection_wifi_status_label = lv_label_create(text_cont);
+-    lv_obj_set_width(connection_wifi_status_label, lv_pct(100));
+-    lv_label_set_long_mode(connection_wifi_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
++    // Show network type - either WiFi SSID or "Ethernet-over-USB"
++    switch(network_mode) {
++        case NETWORK_MODE_WIFI:
++            lv_label_set_text_fmt(label1, "Wi-Fi: %s", ssid);
++            break;
++        case NETWORK_MODE_USB:
++            lv_label_set_text(label1, "Ethernet-over-USB");
++            break;
++    }
++
++    connection_network_status_label = lv_label_create(text_cont);
++    lv_obj_set_width(connection_network_status_label, lv_pct(100));
++    lv_label_set_long_mode(connection_network_status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+ 
+     lv_obj_t *label3 = lv_label_create(text_cont);
+     lv_label_set_text(label3, "Setup Wi-Fi:");
+@@ -283,20 +294,21 @@ static lv_obj_t * create_scr_osmu_logo() {
+     return scr;
+ }
+ 
+-static lv_obj_t * create_scr_urls() {
++static lv_obj_t * create_scr_pool() {
+     lv_obj_t * scr = create_flex_screen(4);
+ 
+     lv_obj_t *label1 = lv_label_create(scr);
+-    lv_label_set_text(label1, "Stratum Host:");
++    lv_label_set_text(label1, "Pool Host:");
+ 
+-    urls_mining_url_label = lv_label_create(scr);
+-    lv_obj_set_width(urls_mining_url_label, LV_HOR_RES);
+-    lv_label_set_long_mode(urls_mining_url_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
++    pool_url_label = lv_label_create(scr);
++    lv_obj_set_width(pool_url_label, LV_HOR_RES);
++    lv_label_set_long_mode(pool_url_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
+ 
+-    lv_obj_t *label3 = lv_label_create(scr);
+-    lv_label_set_text(label3, "IP Address:");
++    pool_difficulty_label = lv_label_create(scr);
++    lv_label_set_text(pool_difficulty_label, "Difficulty: --");
+ 
+-    urls_ip_addr_label = lv_label_create(scr);
++    pool_response_time_label = lv_label_create(scr);
++    lv_label_set_text(pool_response_time_label, "Time: --");
+ 
+     return scr;
+ }
+@@ -339,20 +351,22 @@ static lv_obj_t * create_scr_mining() {
+     return scr;
+ }
+ 
+-static lv_obj_t * create_scr_wifi() {
+-    lv_obj_t * scr = create_flex_screen(4);
++static lv_obj_t * create_scr_network(NetworkMode network_mode) {
++    lv_obj_t * scr = create_flex_screen(network_mode == NETWORK_MODE_WIFI ? 4 : 2);
+ 
+-    lv_obj_t *title_label = lv_label_create(scr);
+-    lv_label_set_text(title_label, "Wi-Fi Signal");
++    network_ip_addr_label = lv_label_create(scr);
++    lv_label_set_text(network_ip_addr_label, "IP: --");
+ 
+-    wifi_rssi_value_label = lv_label_create(scr);
+-    lv_label_set_text(wifi_rssi_value_label, "RSSI: -- dBm");
++    if (network_mode == NETWORK_MODE_WIFI) {
++        network_wifi_rssi_value_label = lv_label_create(scr);
++        lv_label_set_text(network_wifi_rssi_value_label, "RSSI: --");
+ 
+-    wifi_signal_strength_label = lv_label_create(scr);
+-    lv_label_set_text(wifi_signal_strength_label, "Signal: --%%");
++        network_wifi_signal_strength_label = lv_label_create(scr);
++        lv_label_set_text(network_wifi_signal_strength_label, "Signal: --");
++    }
+ 
+-    wifi_uptime_label = lv_label_create(scr);
+-    lv_label_set_text(wifi_uptime_label, "Uptime: --");
++    network_uptime_label = lv_label_create(scr);
++    lv_label_set_text(network_uptime_label, "Uptime: --");
+ 
+     return scr;
+ }
+@@ -494,14 +508,15 @@ static void screen_update_cb(lv_timer_t * timer)
+         return;
+     }
+ 
+-    if (module->ssid[0] == '\0') {
++    // Show welcome screen only if not connected (works for both WiFi and USB)
++    if (module->ssid[0] == '\0' && module->network_mode == NETWORK_MODE_WIFI) {
+         screen_show(SCR_WELCOME);
+         return;
+     }
+ 
+-    bool is_wifi_status_changed = strcmp(module->wifi_status, lv_label_get_text(connection_wifi_status_label)) != 0;
+-    if (is_wifi_status_changed) {
+-        lv_label_set_text(connection_wifi_status_label, module->wifi_status);
++    bool is_network_status_changed = strcmp(module->wifi_status, lv_label_get_text(connection_network_status_label)) != 0;
++    if (is_network_status_changed) {
++        lv_label_set_text(connection_network_status_label, module->wifi_status);
+         screen_show(SCR_CONNECTION);
+         return;
+     }
+@@ -518,12 +533,22 @@ static void screen_update_cb(lv_timer_t * timer)
+     PowerManagementModule * power_management = &GLOBAL_STATE->POWER_MANAGEMENT_MODULE;
+ 
+     char *pool_url = module->is_using_fallback ? module->fallback_pool_url : module->pool_url;
+-    if (strcmp(lv_label_get_text(urls_mining_url_label), pool_url) != 0) {
+-        lv_label_set_text(urls_mining_url_label, pool_url);
++    if (strcmp(lv_label_get_text(pool_url_label), pool_url) != 0) {
++        lv_label_set_text(pool_url_label, pool_url);
++    }
++
++    if (current_pool_response_time != module->response_time) {
++        if (module->response_time > 0) {
++            lv_label_set_text_fmt(pool_response_time_label, "Response: %.1fms", module->response_time);
++        } else {
++            lv_label_set_text(pool_response_time_label, "Response: -- ms");
++        }
++        current_pool_response_time = module->response_time;
+     }
+ 
+-    if (strcmp(lv_label_get_text(urls_ip_addr_label), module->ip_addr_str) != 0) {
+-        lv_label_set_text(urls_ip_addr_label, module->ip_addr_str);
++    if (current_pool_difficulty != module->pool_difficulty) {
++        lv_label_set_text_fmt(pool_difficulty_label, "Difficulty: %d", module->pool_difficulty);
++        current_pool_difficulty = module->pool_difficulty;
+     }
+ 
+     if (current_hashrate != module->current_hashrate) {
+@@ -584,31 +609,34 @@ static void screen_update_cb(lv_timer_t * timer)
+         lv_label_set_text_fmt(mining_network_difficulty_label, "Difficulty: %s", GLOBAL_STATE->network_diff_string);
+     }
+ 
+-    // Update WiFi RSSI periodically
+-    int8_t rssi_value = -128;
+-    if (module->is_connected) {
+-        get_wifi_current_rssi(&rssi_value);
++    // Update Network screen: IP address
++    if (strcmp(lv_label_get_text(network_ip_addr_label), module->ip_addr_str) != 0) {
++        lv_label_set_text_fmt(network_ip_addr_label, "IP: %s", module->ip_addr_str);
+     }
+ 
+-    if (rssi_value != current_rssi_value) {
+-        if (rssi_value > -50) {
+-            lv_label_set_text(wifi_signal_strength_label, "Signal: Excellent");
+-        } else if (rssi_value > -60) {
+-            lv_label_set_text(wifi_signal_strength_label, "Signal: Good");
+-        } else if (rssi_value > -70) {
+-            lv_label_set_text(wifi_signal_strength_label, "Signal: Fair");
+-        } else if (rssi_value > -128){
+-            lv_label_set_text(wifi_signal_strength_label, "Signal: Weak");
+-        } else {
+-            lv_label_set_text(wifi_signal_strength_label, "Signal: --");
+-        }
++    if (module->network_mode == NETWORK_MODE_WIFI && module->is_connected) {
++        int8_t rssi_value = -128;
++        get_wifi_current_rssi(&rssi_value);
++        if (rssi_value != current_rssi_value) {
++            if (rssi_value > -50) {
++                lv_label_set_text(network_wifi_signal_strength_label, "Signal: Excellent");
++            } else if (rssi_value > -60) {
++                lv_label_set_text(network_wifi_signal_strength_label, "Signal: Good");
++            } else if (rssi_value > -70) {
++                lv_label_set_text(network_wifi_signal_strength_label, "Signal: Fair");
++            } else if (rssi_value > -128){
++                lv_label_set_text(network_wifi_signal_strength_label, "Signal: Weak");
++            } else {
++                lv_label_set_text(network_wifi_signal_strength_label, "Signal: --");
++            }
+ 
+-        if (rssi_value > -128) {
+-            lv_label_set_text_fmt(wifi_rssi_value_label, "RSSI: %d dBm", rssi_value);
+-        } else {
+-            lv_label_set_text(wifi_rssi_value_label, "RSSI: -- dBm");
++            if (rssi_value > -128) {
++                lv_label_set_text_fmt(network_wifi_rssi_value_label, "RSSI: %d dBm", rssi_value);
++            } else {
++                lv_label_set_text(network_wifi_rssi_value_label, "RSSI: --");
++            }
++            current_rssi_value = rssi_value;
+         }
+-        current_rssi_value = rssi_value;
+     }
+ 
+     uint32_t shares_accepted = module->shares_accepted;
+@@ -660,7 +688,7 @@ void screen_button_press()
+ 
+ static void uptime_update_cb(lv_timer_t * timer)
+ {
+-    if (wifi_uptime_label) {
++    if (network_uptime_label) {
+         char uptime[50];
+         uint32_t uptime_seconds = (esp_timer_get_time() - GLOBAL_STATE->SYSTEM_MODULE.start_time) / 1000000;
+ 
+@@ -681,8 +709,8 @@ static void uptime_update_cb(lv_timer_t * timer)
+             snprintf(uptime, sizeof(uptime), "Uptime: %" PRIu32 "s", uptime_seconds);
+         }
+ 
+-        if (strcmp(lv_label_get_text(wifi_uptime_label), uptime) != 0) {
+-            lv_label_set_text(wifi_uptime_label, uptime);
++        if (strcmp(lv_label_get_text(network_uptime_label), uptime) != 0) {
++            lv_label_set_text(network_uptime_label, uptime);
+         }
+     }
+ }
+@@ -703,13 +731,13 @@ esp_err_t screen_start(void * pvParameters)
+             screens[SCR_ASIC_STATUS] = create_scr_asic_status();
+             screens[SCR_WELCOME] = create_scr_welcome(SYSTEM_MODULE->ap_ssid);
+             screens[SCR_FIRMWARE] = create_scr_firmware();
+-            screens[SCR_CONNECTION] = create_scr_connection(SYSTEM_MODULE->ssid, SYSTEM_MODULE->ap_ssid);
++            screens[SCR_CONNECTION] = create_scr_connection(SYSTEM_MODULE->ssid, SYSTEM_MODULE->ap_ssid, SYSTEM_MODULE->network_mode);
+             screens[SCR_BITAXE_LOGO] = create_scr_bitaxe_logo(GLOBAL_STATE->DEVICE_CONFIG.family.name, GLOBAL_STATE->DEVICE_CONFIG.board_version);
+             screens[SCR_OSMU_LOGO] = create_scr_osmu_logo();
+-            screens[SCR_URLS] = create_scr_urls();
++            screens[SCR_POOL] = create_scr_pool();
+             screens[SCR_STATS] = create_scr_stats();
+             screens[SCR_MINING] = create_scr_mining();
+-            screens[SCR_WIFI] = create_scr_wifi();
++            screens[SCR_NETWORK] = create_scr_network(SYSTEM_MODULE->network_mode);
+ 
+             scr_create_overlay();
+ 
+diff --git a/main/system.c b/main/system.c
+index dd6f0d0..ac059fe 100644
+--- a/main/system.c
++++ b/main/system.c
+@@ -54,6 +54,20 @@ void SYSTEM_init_system(GlobalState * GLOBAL_STATE)
+     module->block_found = 0;
+     module->show_new_block = false;
+ 
++    // Initialize network configuration strings
++    char * network_mode = nvs_config_get_string(NVS_CONFIG_NETWORK_MODE);
++    if (strcmp(network_mode, "wifi") == 0) {
++        ESP_LOGI(TAG, "Network mode: Wi-Fi");
++        module->network_mode = NETWORK_MODE_WIFI;
++    } else if (strcmp(network_mode, "usb") == 0) {
++        ESP_LOGI(TAG, "Network mode: Ethernet-over-USB");
++        module->network_mode = NETWORK_MODE_USB;
++    } else {
++        ESP_LOGE(TAG, "Invalid network mode: %s", network_mode);
++        module->network_mode = NETWORK_MODE_WIFI;
++    }
++    free(network_mode);
++
+     // Initialize network address strings
+     strcpy(module->ip_addr_str, "");
+     strcpy(module->ipv6_addr_str, "");
+diff --git a/main/tasks/protocol_coordinator.c b/main/tasks/protocol_coordinator.c
+index 7c00fdc..8e52df2 100644
+--- a/main/tasks/protocol_coordinator.c
++++ b/main/tasks/protocol_coordinator.c
+@@ -338,7 +338,7 @@ static void do_heartbeat_probe(GlobalState *gs)
+         return;
+     }
+ 
+-    if (!wifi_is_connected()) {
++    if (!gs->SYSTEM_MODULE.is_connected) {
+         return;
+     }
+ 
+@@ -401,7 +401,7 @@ static void resume_on_pool(GlobalState *gs, bool use_fallback)
+ // Resumes mining as soon as one is reachable.
+ static void try_resume_from_paused(GlobalState *gs)
+ {
+-    if (!wifi_is_connected()) {
++    if (!gs->SYSTEM_MODULE.is_connected) {
+         return;
+     }
+ 
+diff --git a/main/tasks/statistics_task.c b/main/tasks/statistics_task.c
+index 086b932..35f11b0 100644
+--- a/main/tasks/statistics_task.c
++++ b/main/tasks/statistics_task.c
+@@ -166,7 +166,9 @@ void statistics_task(void * pvParameters)
+             // Record every second (DEFAULT_POLL_RATE is 1000ms)
+             if (currentTime >= statsData.timestamp + 1000) {
+                 int8_t wifiRSSI = -90;
+-                get_wifi_current_rssi(&wifiRSSI);
++                if (sys_module->network_mode == NETWORK_MODE_WIFI) {
++                    get_wifi_current_rssi(&wifiRSSI);
++                }
+ 
+                 statsData.timestamp = currentTime;
+                 statsData.hashrate = sys_module->current_hashrate;
+diff --git a/main/tasks/stratum_v1_task.c b/main/tasks/stratum_v1_task.c
+index 3658255..23fd4e5 100644
+--- a/main/tasks/stratum_v1_task.c
++++ b/main/tasks/stratum_v1_task.c
+@@ -196,8 +196,8 @@ void stratum_v1_task(void *pvParameters)
+             continue;
+         }
+ 
+-        if (!wifi_is_connected()) {
+-            ESP_LOGI(TAG, "WiFi disconnected, attempting to reconnect...");
++        if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
++            ESP_LOGI(TAG, "Network disconnected, attempting to reconnect...");
+             vTaskDelay(10000 / portTICK_PERIOD_MS);
+             continue;
+         }
+diff --git a/main/tasks/stratum_v2_task.c b/main/tasks/stratum_v2_task.c
+index 7520145..ebec1ad 100644
+--- a/main/tasks/stratum_v2_task.c
++++ b/main/tasks/stratum_v2_task.c
+@@ -623,8 +623,8 @@ void stratum_v2_task(void *pvParameters)
+             return;
+         }
+ 
+-        if (!wifi_is_connected()) {
+-            ESP_LOGI(TAG, "WiFi disconnected, waiting...");
++        if (!GLOBAL_STATE->SYSTEM_MODULE.is_connected) {
++            ESP_LOGI(TAG, "Network disconnected, waiting...");
+             vTaskDelay(10000 / portTICK_PERIOD_MS);
+             continue;
+         }
+diff --git a/readme.md b/readme.md
+index 534d359..cd19fc3 100755
+--- a/readme.md
++++ b/readme.md
+@@ -213,6 +213,10 @@ In the event that the admin web front end is inaccessible, for example because o
+ 
+ In order to unlock the Input fields for ASIC Frequency and ASIC Core Voltage you need to append `?oc` to the end of the settings tab URL in your browser. Be aware that without additional cooling overclocking can overheat and/or damage your Bitaxe.
+ 
++### Ethernet-over-USB Mode
++
++The Bitaxe supports Ethernet-over-USB (NCM) as an alternative to WiFi connectivity. See [Ethernet-over-USB](ethernet-over-usb.md) for more details.
++
+ ## Development using esp-miner/devcontainer
+ 
+ This configuration allows you to edit locally and compile the source code using a docker container so you don't have to install the ESP-IDF toolchain and other supporting software on your computer to compile the firmware.
+diff --git a/sdkconfig.defaults b/sdkconfig.defaults
+index ab87bcb..d0602bc 100644
+--- a/sdkconfig.defaults
++++ b/sdkconfig.defaults
+@@ -27,6 +27,8 @@ CONFIG_LWIP_IPV6=y
+ CONFIG_LWIP_IPV6_AUTOCONFIG=y
+ CONFIG_LWIP_USE_ESP_GETADDRINFO=y
+ CONFIG_SPIFFS_OBJ_NAME_LEN=64
++CONFIG_TINYUSB_NET_MODE_NCM=y
++CONFIG_TINYUSB_CDC_ENABLED=y
+ CONFIG_LV_CONF_SKIP=n
+ CONFIG_LV_BUILD_EXAMPLES=n
+ CONFIG_LV_BUILD_DEMOS=n
+diff --git a/test-ci/sdkconfig.defaults b/test-ci/sdkconfig.defaults
+index 0e9bbd9..6a1d43e 100644
+--- a/test-ci/sdkconfig.defaults
++++ b/test-ci/sdkconfig.defaults
+@@ -1,2 +1,5 @@
+ CONFIG_ESP_INT_WDT=n
+-CONFIG_ESP_TASK_WDT=n
+\ No newline at end of file
++CONFIG_ESP_TASK_WDT=n
++CONFIG_USB_OTG=y
++CONFIG_TINYUSB_CDC_ENABLED=y
++CONFIG_TINYUSB_NET_MODE_NCM=y
+\ No newline at end of file
