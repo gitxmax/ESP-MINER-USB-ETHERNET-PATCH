@@ -1,4 +1,5 @@
-<img width="1536" height="1024" alt="601usb" src="https://github.com/user-attachments/assets/ed6f8d70-ed55-4e39-9225-700a163c311d" />
+<img width="1536" height="1024" alt="601-ether" src="https://github.com/user-attachments/assets/3150c5a9-d6df-44bd-af8e-2d58a60174e7" />
+
 
 
 
